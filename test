@@ -1,0 +1,448 @@
+from NorenRestApiPy.NorenApi import NorenApi
+import PySimpleGUI as pg
+import pyotp
+import yaml
+import threading
+import calendar
+import pandas as pd
+import numpy as np
+# import multiprocessing
+from time import sleep
+
+
+
+class ShoonyaApiPy(NorenApi):
+    def __init__(self):
+        NorenApi.__init__(self,
+            host='https://api.shoonya.com/NorenWClientTP/', websocket='wss://api.shoonya.com/NorenWSTP/')
+        global api
+        api = self
+
+api = ShoonyaApiPy()
+
+with open('cred.yml') as f:
+    cred = yaml.load(f, Loader=yaml.FullLoader)
+    # print(cred)
+
+api = ShoonyaApiPy()
+
+ret = api.login(
+    userid=cred['user'],
+    password= cred['pwd'],
+    twoFA=pyotp.TOTP(cred['token']).now(),
+    vendor_code=cred['vc'],
+    api_secret=cred['apikey'],
+    imei=cred['imei'])
+
+Order_type =['CE','PE']
+INSTRUMENT =['NIFTY BANK']
+INSTRUMENT_TYPE =['SPOT','FUTURES']
+SUBSCRIBE_SPOT_LIST = ['NIFTY BANK']
+DEFAULT_INSTRUMENT_TYPE = 'SPOT'
+DEFAULT_INSTRUMENT = 'NIFTY BANK'
+DEFAULT_USERNAME = 'FA65719'
+
+Bank_ce_strike_array = []
+Bank_pe_strike_array = []
+
+# global kill_Thread
+
+layout = [
+[pg.Text('Username'), pg.InputText(key='username', size=(15, 3),default_text=DEFAULT_USERNAME),pg.Text(key='result')],
+[pg.Text('Password'), pg.InputText(key='password', password_char='*', size=(15, 3))],
+[pg.Button('Login'), pg.Button('Cancel')],
+[pg.Text('INSTRUMENT_TYPE:'),pg.Combo(INSTRUMENT_TYPE, size=(10, 3), key='-SPOT/FUTURE-',default_value=DEFAULT_INSTRUMENT_TYPE),pg.Combo(INSTRUMENT, size=(10, 3), key='-INSTRUMENT_type-',default_value=DEFAULT_INSTRUMENT)],
+[pg.Button('Subscribe', visible=False),pg.Button('UnSubscribe', visible=False)],
+[pg.Text('ORDER_TYPE:'),pg.Combo(Order_type, size=(5, 3), key='-Order_type-'),pg.Button('select_Strike')],
+[pg.Text('call Strike:', visible=False,key='BCS'),pg.Combo(Bank_ce_strike_array, size=(30, 3), key='-Bank_ce_strike-', visible=False)],
+[pg.Text('Put Strike:', visible=False,key='BPS')],[pg.Combo(Bank_pe_strike_array, size=(30, 3), key='-Bank_pe_strike-', visible=False)],
+[pg.Button('BUY',size=(3, 1), key='BUY'),pg.Button('SELL',size=(4, 1)),pg.Button('Trail SL')],
+[pg.Text(key='LTP', relief='solid',border_width=1),pg.Text(key='opt_ltp', relief='solid',border_width=1),pg.Text(key='avg_price', relief='solid',border_width=1),pg.Text(key='pnl', relief='solid',border_width=1)],
+[pg.Button('CLOSE')]
+]
+
+window = pg.Window('Mint Money', layout)
+
+RESTART_LOOP = False
+is_connected = False
+
+index_list = ['BANKNIFTY']
+websocket_token =[]
+token_list=[]
+symbol_list=[]
+
+
+def get_tokens(exch,query):
+    global token_list,websocket_token,symbol_list
+    ret = api.searchscrip(exchange=exch, searchtext=query)
+    symbols = ret['values'][:1]
+    for symbol in symbols:
+        if symbol['instname'] == 'FUTIDX':
+            token_list.append(symbol['token'])
+            symbol_list.append(symbol['tsym'])
+            websocket_token.append(exch+'|'+symbol['token'])
+
+for x in index_list:
+    get_tokens('NFO', x)
+
+# print(token_list)
+
+def get_expiry():
+    df = pd.read_csv('NFO_symbols.txt');
+    df['Expiry']= pd.to_datetime(df['Expiry']).apply(lambda x: x.date())
+    df = df[df['TradingSymbol'].str.contains("BANKNIFTY")]
+    df.sort_values(by=['Expiry'], inplace=True)
+    df = df.Expiry
+    df = df.iloc[0]
+    return df
+
+weekly_expiry = get_expiry()
+
+expiry_month= str(calendar.month_abbr[weekly_expiry.month])
+expiry_year= weekly_expiry.strftime("%y")
+expiry_day = weekly_expiry.strftime("%d")
+
+# Initialize trailing profit variables
+trailing_profit = 0
+trailing_profit_enabled = False
+
+feed_opened = False
+feedJson = {}
+
+def event_handler_feed_update(tick_data):
+    global feedJson
+    # print(tick_data)
+    if tick_data.get('lp') != None and tick_data.get('tk') != None:
+        feedJson[tick_data['tk']] = float(tick_data['lp'])
+        print(feedJson)
+        update_tick(feedJson)
+
+def event_handler_order_update(tick_data):
+    print(f"Order update {tick_data}")
+
+
+def open_callback():
+    global feed_opened
+    feed_opened = True
+
+
+api.start_websocket(order_update_callback=event_handler_order_update,
+                    subscribe_callback=event_handler_feed_update,
+                    socket_open_callback=open_callback)
+
+while (feed_opened == False):
+    pass
+
+def subscribe_thread(tokens):
+    # print(tokens)
+    try:
+        # Subscribe to the tick data for the symbols
+        api.subscribe(tokens)
+        print("Tick data subscribed successfully for symbols: ", tokens)
+    except Exception as e:
+        print("Error subscribing to tick data: ", e)
+
+
+subscribed_symbols = []
+is_subscribed = False
+spot_bank = False
+future_bank = False
+once_subscribed = False
+tokens=[]
+avg_price=0
+buy_price=[]
+ce_available = False
+pe_available = False
+tok = None
+toke = None
+tokes = None
+key_list = []
+kill_Thread = False
+
+def update_tick(feedJson):
+    if spot_bank == True:
+        window['LTP'].update(feedJson['26009'])
+    if future_bank == True:
+        window['LTP'].update(feedJson[token_list[0]])
+    if ce_available == True or pe_available == True:
+        # opt_ltp_keys = list(feedJson.keys())
+        # window['opt_ltp'].update(feedJson[token_list[1]])
+        window['opt_ltp'].update(feedJson[key_list[-1]])
+
+def get_opt_tokens(exch,query):
+    global token_list,websocket_token,symbol_list
+    ret = api.searchscrip(exchange=exch, searchtext=query)
+    symbols = ret['values'][:1]
+    for symbol in symbols:
+        return symbol['token']
+
+def place_order(buy_or_sell,selected_option):
+    api.place_order(buy_or_sell=buy_or_sell, product_type='I',
+                    exchange='NFO', tradingsymbol=selected_option,
+                    quantity=25, discloseqty=0, price_type='MKT', price=0, trigger_price=None,
+                    retention='DAY', remarks='my_order_001')
+
+def ce_buy_avg_price():
+    global ce_available,avg_price
+    while True :
+        try:
+            if key_list[-1] in feedJson :
+                buy_price.append(feedJson[key_list[-1]])
+                print('feed_json key is {}'.format(key_list[-1]))
+                avg_price = round(np.average(buy_price), 2)
+                ce_available = True
+                print(ce_available)
+                window['avg_price'].update(avg_price)
+                break
+        except Exception as e:
+            print("Error: ", e)
+
+def pe_buy_avg_price():
+    global pe_available,avg_price
+    while True:
+        try:
+            if key_list[-1] in feedJson:
+                buy_price.append(feedJson[key_list[-1]])
+                print('feed_json key is {}'.format(key_list[-1]))
+                print(buy_price)
+                avg_price = round(np.average(buy_price),2)
+                print(avg_price)
+                pe_available = True
+                print(pe_available)
+                window['avg_price'].update(avg_price)
+                break
+        except Exception as e:
+            print("Error : ", e)
+
+
+
+def m2m():
+    global kill_Thread
+    while True:
+        try:
+            if kill_Thread == True :
+                pnl = (feedJson[key_list[-1]] - avg_price) * 25
+                window['pnl'].update(round(pnl,2))
+                sleep(1)
+            if kill_Thread == False:
+                break
+        except Exception as e:
+            print("Error : ", e)
+
+threading.Thread(target=m2m).start()
+
+while True:
+
+    event, values = window.read()
+    if event in (pg.WIN_CLOSED, 'CLOSE','Cancel'):
+        break
+
+    if event == 'Login':
+        username = values['username']
+        password = values['password']
+        if username == cred['user'] and password == cred['pwd']:
+            window['result'].update('Successfully Connected to finvasia')
+            is_connected = True
+        else:
+            window['result'].update('Invalid username or password')
+
+    if is_connected == True:
+        window['Login'].update(disabled=True)
+        window['Subscribe'].update(visible=True)
+        window['UnSubscribe'].update(visible=True)
+        window['LTP'].update(visible=True)
+
+    if event == 'Subscribe' and is_connected == True :
+
+        is_subscribed = True
+
+        if is_subscribed == True and values['-Order_type-'] == 'CE':
+            window['BCS'].update(visible=True)
+
+        if is_subscribed == True and values['-Order_type-'] == 'PE':
+            window['BPS'].update(visible=True)
+            window['-Bank_pe_strike-'].update(visible=True)
+
+        if values['-SPOT/FUTURE-'] == 'SPOT' and values['-INSTRUMENT_type-'] == 'NIFTY BANK':
+            Bank_pe_strike_array.clear()
+            Bank_ce_strike_array.clear()
+            spot_bank = True
+            window['Subscribe'].update(disabled=True)
+            token = ['NSE|26009']
+            tokens.clear()
+            tokens.extend(token)
+            subscribed_symbols.clear()
+            subscribed_symbols.append('NSE|26009')
+            print(subscribed_symbols)
+            threading.Thread(target=subscribe_thread, args=(tokens,)).start()
+
+        if values['-SPOT/FUTURE-'] == 'FUTURES' and values['-INSTRUMENT_type-'] == 'NIFTY BANK':
+            Bank_pe_strike_array.clear()
+            Bank_ce_strike_array.clear()
+            window['BCS'].update(visible=True)
+            window['BPS'].update(visible=True)
+            future_bank = True
+            window['Subscribe'].update(disabled=True)
+            token = [websocket_token[0]]
+            tokens.clear()
+            tokens.extend(token)
+            subscribed_symbols.clear()
+            subscribed_symbols.append(token)
+            print(subscribed_symbols)
+            threading.Thread(target=subscribe_thread,args=(tokens,)).start()
+
+    if event == 'select_Strike' and is_subscribed == True and values['-Order_type-'] == 'CE':
+
+        window['-Bank_ce_strike-'].update(visible=True)
+        window['-Bank_pe_strike-'].update(visible=False)
+
+        Bank_pe_strike_array.clear()
+        Bank_ce_strike_array.clear()
+        incrementor = 100
+
+        if spot_bank == True:
+            Bank_strike_name = 'BANKNIFTY' + expiry_day + expiry_month + expiry_year
+            Bank_Final_String = Bank_strike_name.upper()
+            price = (int(feedJson['26009']) - (int)(feedJson['26009']) % incrementor)
+
+            Bank_ce_strike_array.append(Bank_Final_String + 'C' + str(price))
+            Bank_ce_strike_array.append(Bank_Final_String + 'C' + str(price - 100))
+            Bank_ce_strike_array.append(Bank_Final_String + 'C' + str(price + 100))
+            window['-Bank_ce_strike-'].update(values=Bank_ce_strike_array)
+
+        if future_bank == True:
+            Bank_strike_name = 'BANKNIFTY' + expiry_day + expiry_month + expiry_year
+            Bank_Final_String = Bank_strike_name.upper()
+            price = (int(feedJson[token_list[0]]) - (int)(feedJson[token_list[0]]) % incrementor)
+
+            Bank_ce_strike_array.append(Bank_Final_String + 'C' + str(price))
+            Bank_ce_strike_array.append(Bank_Final_String + 'C' + str(price - 100))
+            Bank_ce_strike_array.append(Bank_Final_String + 'C' + str(price + 100))
+            window['-Bank_ce_strike-'].update(values=Bank_ce_strike_array)
+
+    if event == 'select_Strike' and is_subscribed == True and values['-Order_type-'] == 'PE':
+
+        window['-Bank_pe_strike-'].update(visible=True)
+        window['-Bank_ce_strike-'].update(visible=False)
+
+        Bank_ce_strike_array.clear()
+        Bank_pe_strike_array.clear()
+        incrementor = 100
+
+        if spot_bank == True:
+            Bank_strike_name = 'BANKNIFTY' + expiry_day + expiry_month + expiry_year
+            Bank_Final_String = Bank_strike_name.upper()
+            price = (int(feedJson['26009']) - int(feedJson['26009']) % incrementor)
+
+            Bank_pe_strike_array.append(Bank_Final_String + 'P' + str(price))
+            Bank_pe_strike_array.append(Bank_Final_String + 'P' + str(price - 100))
+            Bank_pe_strike_array.append(Bank_Final_String + 'P' + str(price + 100))
+            window['-Bank_pe_strike-'].update(values=Bank_pe_strike_array)
+
+        if future_bank == True:
+            Bank_strike_name = 'BANKNIFTY' + expiry_day + expiry_month + expiry_year
+            Bank_Final_String = Bank_strike_name.upper()
+            price = (int(feedJson[token_list[0]]) - int(feedJson[token_list[0]]) % incrementor)
+
+            Bank_pe_strike_array.append(Bank_Final_String + 'P' + str(price))
+            Bank_pe_strike_array.append(Bank_Final_String + 'P' + str(price - 100))
+            Bank_pe_strike_array.append(Bank_Final_String + 'P' + str(price + 100))
+            window['-Bank_pe_strike-'].update(values=Bank_pe_strike_array)
+
+    if event == 'BUY' and is_subscribed == True and values['-Order_type-'] == 'CE' and (
+            spot_bank == True or future_bank == True):
+        if pe_available == True:
+            try:
+                pe_available = False
+                buy_price.clear()
+                avg_price = np.float64(0)
+                print('unsubscribed pe {}tokes'.format(tokes))
+                api.unsubscribe(tokes)
+                print('successfully unsubscribed the token {}'.format(tokes))
+                tokes = None
+            except Exception as e:
+                print("Error unsubscribing PE {} from tick data: ".format(tokes), e)
+
+        selected_option = values['-Bank_ce_strike-']
+        print(selected_option)
+
+        if ce_available == False:
+            tok = get_opt_tokens('NFO', selected_option)
+            sleep(0.2)
+            toke = 'NFO|{}'.format(tok)
+            tokes = ['NFO|{}'.format(tok)]
+            # tokes = [toke.format(tok)]
+            print('created CE toke is {}'.format(toke))
+            print('created CE tokes is {}'.format(tokes))
+
+        if toke not in subscribed_symbols:
+            threading.Thread(target=subscribe_thread, args=(toke,)).start()
+            print(key_list)
+            key_list.append(tok)
+            print(key_list)
+            subscribed_symbols.append(toke)
+            print('current subscribed symbol of CE is {}'.format(subscribed_symbols))
+            print('current token_list of CE is {}'.format(key_list[-1]))
+        threading.Thread(target=ce_buy_avg_price).start()
+        kill_Thread = True
+        print('Bank Nifty CE order placed successfully')
+
+    if event == 'BUY' and is_subscribed == True and values['-Order_type-'] == 'PE' and (
+            spot_bank == True or future_bank == True):
+
+        if ce_available == True:
+            try :
+                avg_price = np.float64(0)
+                buy_price.clear()
+                ce_available = False
+                api.unsubscribe(tokes)
+                print('unsubscribed ce {}tokes'.format(tokes))
+                tokes = None
+            except Exception as e:
+                print("Error unsubscribing CE {} from tick data: ".format(tokes), e)
+
+        selected_option = values['-Bank_pe_strike-']
+        print(selected_option)
+
+        if pe_available == False :
+            tok = get_opt_tokens('NFO',selected_option)
+            toke = 'NFO|{}'.format(tok)
+            tokes = ['NFO|{}'.format(tok)]
+            print('created PE toke is {}'.format(toke))
+            print('created PE tokes is {}'.format(tokes))
+
+        if toke not in subscribed_symbols:
+            threading.Thread(target=subscribe_thread, args=(toke,)).start()
+            subscribed_symbols.append(toke)
+            print(key_list)
+            key_list.append(tok)
+            print(key_list)
+            print('current subscribed symbol of PE is {}'.format(subscribed_symbols))
+            print('subscribed PE token is {}'.format(key_list[-1]))
+
+        threading.Thread(target=pe_buy_avg_price).start()
+        kill_Thread = True
+        # threading.Thread(target=m2m).start()
+
+        print('Bank Nifty  PE order placed successfully')
+
+
+    if event == 'UnSubscribe' and is_connected == True:
+        window['Subscribe'].update(disabled=False)
+        try:
+            spot_bank = future_bank = kill_Thread= False
+            for symbol in subscribed_symbols:
+                api.unsubscribe(symbol)
+            subscribed_symbols.clear()
+            feedJson.clear()
+            if ce_available or pe_available == True:
+                ce_available = pe_available = False
+                key_list.clear()
+                buy_price.clear()
+                avg_price = np.float64(0)
+
+            print("Tick data unsubscribed successfully")
+        except Exception as e:
+            print("Error unsubscribing from tick data: ", e)
+
+
